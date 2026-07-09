@@ -367,6 +367,16 @@ async def cmd_jellyfin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(get_jellyfin())
 
+async def cmd_ram(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await update.message.reply_text(get_ram())
+
+async def cmd_uptime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await update.message.reply_text(get_uptime())
+
 async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ALLOWED_CHAT_ID:
         return
@@ -427,6 +437,8 @@ app.add_handler(CommandHandler("status", cmd_status))
 app.add_handler(CommandHandler("disk", cmd_disk))
 app.add_handler(CommandHandler("jellyfin", cmd_jellyfin))
 app.add_handler(CommandHandler("help", cmd_help))
+app.add_handler(CommandHandler("ram", cmd_ram))
+app.add_handler(CommandHandler("uptime", cmd_uptime))
 
 
 # Natural language for normal messages
