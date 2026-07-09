@@ -16,12 +16,19 @@ CPU temperature, disk usage, or service status at any time.
 -  Sends an alert when the server comes back online
 -  Sends an alert on repeated failed SSH login attempts
 -  Sends an alert if Jellyfin goes down
+-  List all running services
+-  Stop/start/restart any service via chat
+-  View live service logs
+-  Natural language service control — just type "stop jellyfin" or "show nginx logs"
+-  /help command showing all available commands
 
 ## Requirements
 - A server running Debian 12 or later
 - A personal computer or phone to receive notifications
 - A Telegram account and internet connection
 - Basic knowledge of Linux terminal commands
+- Ollama running locally with Mistral model installed
+
 
   
 ## installation
@@ -50,11 +57,17 @@ https://api.telegram.org/botYOUR_TELEGRAM_TOKEN/getUpdates
 Look for "id": inside "chat" — that is your chat ID.
 
 
-### step 4 install dependencies
+### step 4a install dependencies
 ```
 sudo apt install lm-sensors python3-pip -y
 sudo sensors-detect --auto
 sudo pip3 install python-telegram-bot --break-system-packages
+```
+### step 4b install Ollama and mistral
+
+```
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull mistral
 ```
 
 ### step 5 Create the monitoring script
@@ -138,22 +151,21 @@ Replace YOUR_TELEGRAM_TOKEN and YOUR_CHAT_ID with your real values before runnin
 ```
 #!/usr/bin/env python3
 import subprocess
+import requests
+import json
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 TOKEN = "YOUR_TELEGRAM_TOKEN"
 ALLOWED_CHAT_ID = YOUR_CHAT_ID
 
-async def temp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ALLOWED_CHAT_ID:
-        return
-    result = subprocess.run(["sensors"], capture_output=True, text=True)
-    temp_line = [l for l in result.stdout.split("\n") if "Package id 0" in l][0]
-    await update.message.reply_text(f" {temp_line.strip()}")
+# ── Server functions ──────────────────────────────────────
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ALLOWED_CHAT_ID:
-        return
+def get_temp():
+    result = subprocess.run("sensors | grep 'Package id 0' | awk '{print $4}'", shell=True, capture_output=True, text=True)
+    return f" CPU Temperature: {result.stdout.strip()}"
+
+def get_status():
     cpu = subprocess.run("top -bn1 | grep 'Cpu(s)' | awk '{print $2}'", shell=True, capture_output=True, text=True).stdout.strip()
     ram = subprocess.run("free -h | awk '/Mem:/ {print $3\"/\"$2}'", shell=True, capture_output=True, text=True).stdout.strip()
     disk_raw = subprocess.run("df -h | grep -E '^/dev/' | awk '{print $1\" \"$3\"/\"$2\" (\"$5\" used)\"}'", shell=True, capture_output=True, text=True).stdout.strip()
@@ -162,8 +174,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uptime = subprocess.run("uptime -p", shell=True, capture_output=True, text=True).stdout.strip()
     jellyfin = subprocess.run(["systemctl", "is-active", "jellyfin"], capture_output=True, text=True).stdout.strip()
     jellyfin_emoji = "" if jellyfin == "active" else ""
-
-    msg = (
+    return (
         f" Server Status\n\n"
         f" Uptime: {uptime}\n"
         f" CPU: {cpu}%\n"
@@ -172,30 +183,258 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f" Disks:\n{disk}\n\n"
         f" Jellyfin: {jellyfin_emoji} {jellyfin}"
     )
-    await update.message.reply_text(msg)
 
-async def disk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ALLOWED_CHAT_ID:
-        return
-    result = subprocess.run("df -h", shell=True, capture_output=True, text=True)
-    await update.message.reply_text(f" Disk usage:\n\n{result.stdout}")
+def get_disk():
+    result = subprocess.run("df -h | grep -E '^/dev/'", shell=True, capture_output=True, text=True)
+    disk = result.stdout.replace("/dev/sda1", " SSD").replace("/dev/sdb1", " MEDIA")
+    return f" Disk usage:\n\n{disk}"
 
-async def jellyfin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ALLOWED_CHAT_ID:
-        return
+def get_jellyfin():
     result = subprocess.run(["systemctl", "is-active", "jellyfin"], capture_output=True, text=True)
     status = result.stdout.strip()
     emoji = "" if status == "active" else ""
-    await update.message.reply_text(f"{emoji} Jellyfin is {status}")
+    return f"{emoji} Jellyfin is {status}"
+
+def get_ram():
+    result = subprocess.run("free -h", shell=True, capture_output=True, text=True)
+    return f" RAM usage:\n\n{result.stdout}"
+
+def get_uptime():
+    result = subprocess.run("uptime -p", shell=True, capture_output=True, text=True)
+    return f" Uptime: {result.stdout.strip()}"
+
+def get_services():
+    result = subprocess.run(
+        "systemctl list-units --type=service --state=running --no-pager --no-legend | awk '{print $1}'",
+        shell=True, capture_output=True, text=True
+    )
+    services = result.stdout.strip()
+    return f" Running services:\n\n{services}"
+
+def manage_service(action, service_name):
+    # Safety check — block dangerous commands
+    BLOCKED = ["sshd", "ssh", "networking", "systemd", "dbus", "cron"]
+    if any(blocked in service_name.lower() for blocked in BLOCKED):
+        return f" Cannot {action} {service_name} — this service is protected."
+
+    result = subprocess.run(
+        ["systemctl", action, service_name],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        return f" Successfully ran '{action}' on {service_name}"
+    else:
+        return f" Failed to {action} {service_name}:\n{result.stderr.strip()}"
+
+def get_service_logs(service_name):
+    result = subprocess.run(
+        f"journalctl -u {service_name} -n 20 --no-pager",
+        shell=True, capture_output=True, text=True
+    )
+    return f" Last 20 logs for {service_name}:\n\n{result.stdout.strip()}"
+
+def get_help():
+    return (
+        " Here is everything I can do:\n\n"
+        " *Server Info*\n"
+        "/status — Full server overview\n"
+        "/temp — CPU temperature\n"
+        "/disk — Disk usage\n"
+        "/ram — RAM usage\n"
+        "/uptime — How long the server has been running\n\n"
+        " *Services*\n"
+        "/jellyfin — Check if Jellyfin is running\n"
+        "/services — List all running services\n"
+        "/start <name> — Start a service\n"
+        "/stop <name> — Stop a service\n"
+        "/restart <name> — Restart a service\n"
+        "/logs <name> — Show last 20 logs of a service\n\n"
+        " *Natural Language*\n"
+        "You can also just ask me normally, for example:\n"
+        "• 'is everything ok?'\n"
+        "• 'how hot is my cpu?'\n"
+        "• 'is jellyfin working?'\n"
+        "• 'how much disk space is left?'\n\n"
+        " *Help*\n"
+        "/help — Show this message"
+    )
+# ── Ollama natural language handler ───────────────────────
+
+def ask_ollama(user_message):
+    prompt = f"""You are a server assistant. Based on the user's message, decide which action to take.
+Only respond with one of these exact formats, nothing else:
+
+- status
+- temp
+- disk
+- jellyfin
+- ram
+- uptime
+- help
+- services
+- stop <service-name>
+- start <service-name>
+- restart <service-name>
+- logs <service-name>
+- unknown
+
+Examples:
+"stop zerotier" → stop zerotier-one.service
+"restart jellyfin" → restart jellyfin.service
+"show me the logs for nginx" → logs nginx.service
+"start ollama" → start ollama.service
+"how hot is my cpu" → temp
+"is everything ok" → status
+
+Always add .service at the end of service names.
+
+User message: "{user_message}"
+"""
+    response = requests.post("http://localhost:11434/api/generate", json={
+        "model": "mistral",
+        "prompt": prompt,
+        "stream": False
+    })
+    result = response.json()["response"].strip().lower()
+
+    for keyword in ["status", "temp", "disk", "jellyfin", "ram", "uptime", "help", "services"]:
+        if result.startswith(keyword):
+            return keyword
+
+    for action in ["stop", "start", "restart", "logs"]:
+        if result.startswith(action):
+            parts = result.split()
+            if len(parts) >= 2:
+                return f"{action} {parts[1]}"
+
+    return "unknown"
+
+# ── Telegram handlers ─────────────────────────────────────
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+
+    user_message = update.message.text
+    await update.message.reply_text(" Thinking...")
+
+    action = ask_ollama(user_message)
+    parts = action.split()
+
+    if action == "status":
+        await update.message.reply_text(get_status())
+    elif action == "temp":
+        await update.message.reply_text(get_temp())
+    elif action == "disk":
+        await update.message.reply_text(get_disk())
+    elif action == "jellyfin":
+        await update.message.reply_text(get_jellyfin())
+    elif action == "ram":
+        await update.message.reply_text(get_ram())
+    elif action == "uptime":
+        await update.message.reply_text(get_uptime())
+    elif action == "help":
+        await update.message.reply_text(get_help(), parse_mode="Markdown")
+    elif action == "services":
+        await update.message.reply_text(get_services())
+    elif len(parts) == 2 and parts[0] in ["stop", "start", "restart"]:
+        await update.message.reply_text(manage_service(parts[0], parts[1]))
+    elif len(parts) == 2 and parts[0] == "logs":
+        await update.message.reply_text(get_service_logs(parts[1]))
+    else:
+        await update.message.reply_text(
+            " I didn't understand that. Type /help to see everything I can do."
+        )
+# ── Command handlers (keep the old ones working too) ──────
+
+async def cmd_temp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await update.message.reply_text(get_temp())
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await update.message.reply_text(get_status())
+
+async def cmd_disk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await update.message.reply_text(get_disk())
+
+async def cmd_jellyfin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await update.message.reply_text(get_jellyfin())
+
+async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await update.message.reply_text(get_services())
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /stop <service-name>\nExample: /stop jellyfin")
+        return
+    service = context.args[0]
+    await update.message.reply_text(manage_service("stop", service))
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /start <service-name>\nExample: /start jellyfin")
+        return
+    service = context.args[0]
+    await update.message.reply_text(manage_service("start", service))
+
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /restart <service-name>\nExample: /restart jellyfin")
+        return
+    service = context.args[0]
+    await update.message.reply_text(manage_service("restart", service))
+
+async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /logs <service-name>\nExample: /logs jellyfin")
+        return
+    service = context.args[0]
+    await update.message.reply_text(get_service_logs(service))
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await update.message.reply_text(get_help(), parse_mode="Markdown")
+# ── Start bot ─────────────────────────────────────────────
 
 app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("temp", temp))
-app.add_handler(CommandHandler("status", status))
-app.add_handler(CommandHandler("disk", disk))
-app.add_handler(CommandHandler("jellyfin", jellyfin))
 
-print("Bot is running...")
-app.run_polling()
+# Slash commands still work
+app.add_handler(CommandHandler("services", cmd_services))
+app.add_handler(CommandHandler("stop", cmd_stop))
+app.add_handler(CommandHandler("start", cmd_start))
+app.add_handler(CommandHandler("restart", cmd_restart))
+app.add_handler(CommandHandler("logs", cmd_logs))
+app.add_handler(CommandHandler("temp", cmd_temp))
+app.add_handler(CommandHandler("status", cmd_status))
+app.add_handler(CommandHandler("disk", cmd_disk))
+app.add_handler(CommandHandler("jellyfin", cmd_jellyfin))
+app.add_handler(CommandHandler("help", cmd_help))
+
+
+# Natural language for normal messages
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+print("Bot is running with Ollama natural language support...")
+app.run_polling()                                                    
+
 ```
 
 ### step 7 set up systemd services
@@ -302,6 +541,13 @@ Send these commands directly to your Telegram bot:
 | `/temp` | Current CPU temperature |
 | `/disk` | Full disk usage for all drives |
 | `/jellyfin` | Check if Jellyfin is running |
+| `/services` | List all running services |
+| `/start <name>` | Start a service |
+| `/stop <name>` | Stop a service |
+| `/restart <name>` | Restart a service |
+| `/logs <name>` | Show last 20 logs of a service |
+| `/help` |  Show all available commands |
+
 
 ## file Structure
 ```
