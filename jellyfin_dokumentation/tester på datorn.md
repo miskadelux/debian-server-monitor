@@ -35,4 +35,12 @@ Syns i BIOS + rimlig SMART + monterar men saknar filer → logiskt fel, TestDisk
 Klickljud eller extremt höga SMART-fel → fysiskt fel, mjukvara hjälper inte, professionell räddning krävs om datan är viktig
 
 ### 7 kör och identifiera alla diskar
+kör   
 ```lsblk -o NAME,SIZE,MODEL,SERIAL,FSTYPE,MOUNTPOINTS```
+och   
+```sudo fdisk -l /dev/sdb```
+
+### 8 vad säger linux när man försöker prata med disken?
+```sudo dmesg | tail -100```
+
+
